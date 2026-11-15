@@ -77,6 +77,9 @@ pub struct FrameMask {
     /// Mask logits at 256 x 256 (positive is inside the object); `-1024` everywhere when the
     /// object is absent.
     pub logits: Vec<f32>,
+    /// Selected decoder scores before optional video-predictor processing. Present only when a
+    /// score processor is installed; shared when a conditioning result is retained or returned.
+    pub decoder_logits: Option<Arc<Vec<f32>>>,
     /// The model's own estimate of the mask quality (0..1).
     pub iou: f32,
     /// Object-presence logit; at or below zero the object is not in the frame.
@@ -292,6 +295,7 @@ pub struct VideoTracker<'a> {
     cache: VecDeque<(usize, Arc<FrameFeatures>)>,
     budget: Budget,
     peak: usize,
+    score_processor: Option<Box<dyn FnMut(&[f32]) -> Result<Vec<f32>> + 'a>>,
 }
 
 fn sine_embedding_1d(positions: &[f32], dim: usize) -> Result<Tensor> {
@@ -315,7 +319,7 @@ impl<'a> VideoTracker<'a> {
         if n == 0 || n > MAX_FRAMES {
             return Err(Error::Input(format!("a clip needs between 1 and {MAX_FRAMES} frames, got {n}")));
         }
-        Ok(VideoTracker { model, frames, objects: BTreeMap::new(), cache: VecDeque::new(), budget: Budget::default(), peak: 0 })
+        Ok(VideoTracker { model, frames, objects: BTreeMap::new(), cache: VecDeque::new(), budget: Budget::default(), peak: 0, score_processor: None })
     }
 
     pub fn num_frames(&self) -> usize {
@@ -327,10 +331,39 @@ impl<'a> VideoTracker<'a> {
         self.budget = budget;
     }
 
+    /// Install host-owned low-resolution video-predictor processing. Existing users keep the raw
+    /// path. Change policy only on an empty tracker, so cached results never mix policies.
+    /// The host may reuse its GPU connected-component implementation without adding a second GPU
+    /// runtime here. Unaffected scores must be preserved by the processor.
+    pub fn set_score_processor(&mut self, processor: Option<Box<dyn FnMut(&[f32]) -> Result<Vec<f32>> + 'a>>) -> Result<()> {
+        if !self.objects.is_empty() {
+            return Err(Error::Input("reset the tracker before changing video-predictor processing".into()));
+        }
+        self.score_processor = processor;
+        Ok(())
+    }
+
+    /// Apply the installed policy without changing tracker state. This also lets the host derive
+    /// the next click's input from separately persisted decoder scores.
+    pub fn process_mask_scores(&mut self, scores: &[f32]) -> Result<Vec<f32>> {
+        if scores.len() != RESULT_BYTES / 4 || scores.iter().any(|v| !v.is_finite()) {
+            return Err(Error::Input("predictor scores must be finite 256x256 F32".into()));
+        }
+        let processed = match self.score_processor.as_mut() {
+            Some(f) => f(scores)?,
+            None => scores.to_vec(),
+        };
+        if processed.len() != scores.len() || processed.iter().any(|v| !v.is_finite()) {
+            return Err(Error::Input("video-predictor processor returned malformed scores".into()));
+        }
+        Ok(processed)
+    }
+
     /// Bytes held now: stored frames, kept results and cached features.
     pub fn state_bytes(&self) -> usize {
         let frames: usize = self.objects.values().map(|o| (o.cond.len() + o.non_cond.len()) * FRAME_BYTES + o.cond.len() * RESULT_BYTES).sum();
-        frames + self.cache.len() * FEATURE_BYTES
+        let raw: usize = self.objects.values().flat_map(|o| o.cond.values()).filter_map(|o| o.result.as_ref()).filter_map(|r| r.decoder_logits.as_ref()).map(|v| v.len() * 4).sum();
+        frames + raw + self.cache.len() * FEATURE_BYTES
     }
 
     /// The most [`VideoTracker::state_bytes`] reached so far.
@@ -482,7 +515,16 @@ impl<'a> VideoTracker<'a> {
         let token = if multimask { out.sam_tokens.narrow(1, best, 1)? } else { out.sam_tokens.narrow(1, 0, 1)? }.squeeze(1)?;
         let pointer = if present { model.pointer_proj.forward(&token)? } else { model.no_object_pointer.clone() };
 
-        let high = low.upsample_bilinear2d(INPUT_SIZE, INPUT_SIZE, false)?;
+        let decoder_logits = self.score_processor.as_ref().map(|_| low.flatten_all()?.to_vec1::<f32>().map(Arc::new)).transpose()?;
+        let processed = if let Some(raw) = decoder_logits.as_ref() {
+            Some(Tensor::from_vec(self.process_mask_scores(raw)?, low.shape(), low.device())?)
+        } else {
+            None
+        };
+        // Interactive predictions are processed before their memory is made. Propagated memory
+        // uses the decoder prediction, while its returned/cached output is processed afterwards.
+        let memory_low = if prompt.is_some() { processed.as_ref().unwrap_or(&low) } else { &low };
+        let high = memory_low.upsample_bilinear2d(INPUT_SIZE, INPUT_SIZE, false)?;
         let for_memory = if prompt.is_some() { high.gt(0f32)?.to_dtype(DType::F32)? } else { sigmoid(&high)? };
         let for_memory = ((for_memory * 20.0)? - 10.0)?;
         mark("upsample and mask");
@@ -490,7 +532,7 @@ impl<'a> VideoTracker<'a> {
         mark("memory encoder");
 
         let iou = ious.get(best).copied().unwrap_or(0.0);
-        let result = FrameMask { frame, object: id, logits: low.flatten_all()?.to_vec1::<f32>()?, iou, object_score: score, occluded: !present };
+        let result = FrameMask { frame, object: id, logits: processed.as_ref().unwrap_or(&low).flatten_all()?.to_vec1::<f32>()?, decoder_logits, iou, object_score: score, occluded: !present };
         let state = self.objects.entry(id).or_default();
         let entry = FrameOut { memory, pointer, result: conditioning.then(|| result.clone()) };
         if conditioning {
@@ -596,7 +638,7 @@ impl<'a> VideoTracker<'a> {
         let pointer = if present { pointer } else { model.no_object_pointer.clone() };
         let memory = model.memorize(&feats.low, &high, present)?;
         let score = if present { 10.0 } else { -10.0 };
-        let result = FrameMask { frame, object: id, logits: low, iou: 1.0, object_score: score, occluded: !present };
+        let result = FrameMask { frame, object: id, logits: low, decoder_logits: None, iou: 1.0, object_score: score, occluded: !present };
         let state = self.objects.entry(id).or_default();
         let entry = FrameOut { memory, pointer, result: conditioning.then(|| result.clone()) };
         if conditioning {
