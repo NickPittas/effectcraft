@@ -432,6 +432,12 @@ impl<'a> VideoTracker<'a> {
 
     /// Run the model on one frame for one object and store the result.
     fn step(&mut self, id: ObjectId, frame: usize, prompt: Option<&Prompt>, reverse: bool, conditioning: bool) -> Result<FrameMask> {
+        self.step_with_mask(id, frame, prompt, None, reverse, conditioning)
+    }
+
+    /// [`Self::step`] with an optional previous-mask dense prompt (`[1, 1, 256, 256]` logits,
+    /// already validated and clamped to [-32, 32] by the caller).
+    fn step_with_mask(&mut self, id: ObjectId, frame: usize, prompt: Option<&Prompt>, mask_logits: Option<&Tensor>, reverse: bool, conditioning: bool) -> Result<FrameMask> {
         // EFFECTCRAFT_SAM2_PROFILE=1 prints where a frame's time goes (stderr).
         let profile = std::env::var_os("EFFECTCRAFT_SAM2_PROFILE").is_some();
         let mut lap = std::time::Instant::now();
@@ -460,7 +466,10 @@ impl<'a> VideoTracker<'a> {
             Some(p) => model.image.prompt.sparse(p)?,
             None => model.image.prompt.sparse_none()?,
         };
-        let dense = model.image.prompt.dense_empty()?;
+        let dense = match mask_logits {
+            Some(m) => model.image.prompt.dense_mask(m)?,
+            None => model.image.prompt.dense_empty()?,
+        };
         let out = model.image.decode_embedded(&conditioned, &feats.high, &sparse, &dense, multimask)?;
 
         mark("decoder");
@@ -514,19 +523,39 @@ impl<'a> VideoTracker<'a> {
     /// Prompt an object on a frame (clicks and/or a box). The frame becomes one of the object's
     /// conditioning frames when it has not been tracked yet; the mask comes back at once.
     pub fn prompt(&mut self, frame: usize, object: ObjectId, prompt: &Prompt) -> Result<FrameMask> {
+        self.prompt_with_mask_logits(frame, object, prompt, None)
+    }
+
+    /// [`Self::prompt`] with the object's previous raw low-resolution mask logits (`[1, 1, 256, 256]`
+    /// F32, finite) as the dense mask prompt, like the reference `add_new_points_or_box` using the
+    /// preceding logits clamped to [-32, 32]. `None` is identical to [`Self::prompt`]. Only the
+    /// prompted step uses it; propagation is unchanged.
+    pub fn prompt_with_mask_logits(&mut self, frame: usize, object: ObjectId, prompt: &Prompt, mask_logits: Option<&Tensor>) -> Result<FrameMask> {
         self.check_frame(frame)?;
         prompt.validate()?;
         if prompt.points.is_empty() && prompt.bbox.is_none() {
             return Err(Error::Input("a prompt needs at least one point or a box".into()));
         }
+        let dense = match mask_logits {
+            Some(m) => {
+                if m.dims() != [1, 1, 4 * GRID, 4 * GRID] || m.dtype() != DType::F32 {
+                    return Err(Error::Input(format!("mask logits must be F32 [1, 1, {0}, {0}], got {1:?} {2:?}", 4 * GRID, m.dtype(), m.dims())));
+                }
+                if m.flatten_all()?.to_vec1::<f32>()?.iter().any(|v| !v.is_finite()) {
+                    return Err(Error::Input("mask logits must be finite".into()));
+                }
+                Some(m.clamp(-32f32, 32f32)?)
+            }
+            None => None,
+        };
         let tracked = self.objects.get(&object).is_some_and(|o| o.non_cond.contains_key(&frame));
         if tracked {
             // A correction on a tracked frame is conditioned on the memory like any tracked frame.
             let reverse = false;
-            return self.step(object, frame, Some(prompt), reverse, false);
+            return self.step_with_mask(object, frame, Some(prompt), dense.as_ref(), reverse, false);
         }
         self.objects.entry(object).or_default();
-        self.step(object, frame, Some(prompt), false, true)
+        self.step_with_mask(object, frame, Some(prompt), dense.as_ref(), false, true)
     }
 
     /// Prompt an object on a frame with a mask: `[1, 1, 1024, 1024]` of 0 and 1 (see
